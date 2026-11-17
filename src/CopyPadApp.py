@@ -58,6 +58,11 @@ _user32.GetAncestor.restype = wintypes.HWND
 _user32.GetClipboardSequenceNumber.argtypes = []
 _user32.GetClipboardSequenceNumber.restype = wintypes.DWORD
 try:
+    _user32.SetWindowRgn.argtypes = [wintypes.HWND, wintypes.HRGN, wintypes.BOOL]
+    _user32.SetWindowRgn.restype = ctypes.c_int
+except Exception:
+    pass
+try:
     _user32.AddClipboardFormatListener.argtypes = [wintypes.HWND]
     _user32.AddClipboardFormatListener.restype = wintypes.BOOL
 except Exception:
@@ -464,6 +469,11 @@ def round_rect(c, x1, y1, x2, y2, r=9, **kw):
 
 def wrap_text(text, f, maxw, maxlines=2):
     s = text.replace("\r", " ").replace("\n", " / ").replace("\t", "  ")
+    if not s:
+        return [""]
+    # 大多数片段很短：一次测量就能确定单行，不必逐字符累加
+    if f.measure(s) <= maxw:
+        return [s]
     lines, cur, i = [], "", 0
     while i < len(s) and len(lines) < maxlines:
         ch = s[i]
@@ -514,6 +524,8 @@ class App:
         self._toast_job = None
         self._mv = None
         self._rs = None
+        self._resize_job = None
+        self._pending_size = None
         self._build_ui()
         self._apply_theme()
         self._load_geometry()
@@ -521,6 +533,7 @@ class App:
         self.root.after(40, self._drain)
         self.root.after(600, self._poll_clipboard)
         self.root.after(300, self.apply_region)
+        self.root.after(120, self._update_minsize)
 
     # ---- 跨线程调度 ----
     def post(self, fn, *args):
@@ -571,7 +584,7 @@ class App:
         except Exception:
             pass
         r.protocol("WM_DELETE_WINDOW", self.hide)
-        r.minsize(330, 340)
+        r.minsize(330, 240)
 
         fam = set(tkfont.families())
         family = "Microsoft YaHei UI" if "Microsoft YaHei UI" in fam else (
@@ -666,7 +679,7 @@ class App:
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
         self.canvas.bind("<Button-3>", self._context)
         self.canvas.bind("<Motion>", self._on_hover_motion)
-        self.canvas.bind("<Configure>", lambda e: (self.refresh(), None)[1])
+        self.canvas.bind("<Configure>", self._on_configure)
 
         # -------- 底部 --------
         foot = tk.Frame(outer, padx=12, pady=10)
@@ -719,6 +732,7 @@ class App:
         # a small window pushes the input box out of view entirely.
         foot.pack(fill="x", side="bottom")
         self.canvas.pack(fill="both", expand=True, side="top")
+        self.head, self.foot = head, foot
 
         # ---- 全局键盘 ----
         r.bind("<Up>", lambda e: None if self._in_entry() else self.move_sel(-1))
@@ -823,6 +837,27 @@ class App:
             return False
 
     # ---- 窗口几何 ----
+    def _update_minsize(self):
+        """最小高度按“列表区约 1.5 行”算，而不是固定值。
+
+        head/foot 的实际高度随字体与 DPI 变化，实测一次再定最小尺寸，
+        这样把窗口拖到最小时停在同一位置，不会因机器不同而多显示或少显示。
+        """
+        try:
+            self.root.update_idletasks()
+            head_h = self.head.winfo_height() or 82
+            foot_h = self.foot.winfo_height() or 74
+            # 列表内容从 y=8 开始，单行 44px + 行距 6px，1.5 行约 80px
+            self._min_h = max(210, head_h + foot_h + 82)
+            self.root.minsize(330, self._min_h)
+            w = max(330, self.root.winfo_width())
+            h = max(self._min_h, self.root.winfo_height())
+            if (w, h) != (self.root.winfo_width(), self.root.winfo_height()):
+                self.root.geometry("%dx%d" % (w, h))
+                self.apply_region()
+        except Exception as e:
+            log("update_minsize: %r" % (e,))
+
     def _load_geometry(self):
         g = self.store.settings.get("geom")
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
@@ -830,7 +865,7 @@ class App:
             if isinstance(g, (list, tuple)) and len(g) == 4:
                 x, y, w, h = [int(v) for v in g]
                 w = max(330, min(w, sw - 20))
-                h = max(340, min(h, sh - 40))
+                h = max(getattr(self, "_min_h", 240), min(h, sh - 40))
                 x = max(0, min(x, sw - w))
                 y = max(0, min(y, sh - h))
             else:
@@ -881,18 +916,48 @@ class App:
 
     def _start_resize(self, e):
         self._rs = (e.x_root, e.y_root, self.root.winfo_width(), self.root.winfo_height())
+        # 拖动期间临时取消圆角裁剪：SetWindowRgn 会触发整窗重绘，
+        # 每个 mousemove 都调一次就会闪。松手时再恢复圆角。
+        self._clear_region()
+
+    def _clear_region(self):
+        try:
+            _user32.SetWindowRgn(wintypes.HWND(tk_hwnd(self.root)), None, True)
+        except Exception as e:
+            log("clear_region: %r" % (e,))
 
     def _on_resize(self, e):
         if not self._rs:
             return
+        mn = getattr(self, "_min_h", 240)
         w = max(330, self._rs[2] + e.x_root - self._rs[0])
-        h = max(340, self._rs[3] + e.y_root - self._rs[1])
-        self.root.geometry("%dx%d" % (w, h))
-        self.apply_region()
+        h = max(mn, self._rs[3] + e.y_root - self._rs[1])
+        self._pending_size = (w, h)
+        # 合并高频 mousemove：一帧最多重排一次
+        if self._resize_job is None:
+            self._resize_job = self.root.after(16, self._apply_resize)
+
+    def _apply_resize(self):
+        self._resize_job = None
+        size, self._pending_size = self._pending_size, None
+        if not size:
+            return
+        self.root.geometry("%dx%d" % size)
         self.refresh()
 
     def _end_resize(self, e):
         self._rs = None
+        if self._resize_job is not None:
+            try:
+                self.root.after_cancel(self._resize_job)
+            except Exception:
+                pass
+            self._resize_job = None
+        size, self._pending_size = self._pending_size, None
+        if size:
+            self.root.geometry("%dx%d" % size)
+        self.apply_region()
+        self.refresh()
         self.save_geometry()
 
     # ---- 显示 / 隐藏 ----
@@ -990,10 +1055,14 @@ class App:
     def update_status(self):
         n = len(self.store.items)
         hn = len(self.store.history)
-        base = "%d 条片段 · %d 条历史    Ctrl+Shift+Space 唤起" % (n, hn)
-        if self._toast_job is None:
-            self.status.configure(text=base)
+        base = "%d 条片段 · %d 条历史" % (n, hn)
         self._status_base = base
+        if self._toast_job is None:
+            try:
+                if self.status.cget("text") != base:
+                    self.status.configure(text=base)
+            except Exception:
+                pass
 
     def toast(self, msg):
         try:
@@ -1076,6 +1145,12 @@ class App:
         if it.get("tag"):
             cv.create_text(x1 - 80, y + rh - 9, text=it["tag"], anchor="e",
                            fill=col["muted"], font=self.font_small)
+
+    def _on_configure(self, e):
+        # 拖动缩放时由 _apply_resize 统一重排，避免一次拖动触发两遍
+        if self._rs is not None:
+            return
+        self.refresh()
 
     # ---- 命中测试 ----
     def hit_test(self, y):
