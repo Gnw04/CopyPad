@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.spec
+src/build/
+src/dist/
+*.log
+.demo_data/
+.venv/
+venv/
+Thumbs.db
+desktop.ini
