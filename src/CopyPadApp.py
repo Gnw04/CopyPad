@@ -28,11 +28,11 @@ import win32api
 import win32con
 import win32event
 import win32gui
-import win32clipboard
 import winerror
 import winreg
 
 APP = "CopyPad"
+BUILD_TAG = "2.0.2"
 WND_CLASS = "CopyPadNativeWindow_v2"
 MUTEX_NAME = "CopyPadSingleton_v2"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -68,6 +68,34 @@ try:
 except Exception:
     pass
 
+# ---- 剪贴板走纯 ctypes：pywin32 的 SetClipboardData 在真机上会偶发
+# ---- error(6,'句柄无效') 并把进程一起带崩，不能用在主链路上
+_u32 = _user32
+_k32 = ctypes.windll.kernel32
+GMEM_MOVEABLE = 0x0002
+CF_UNICODETEXT = 13
+
+
+def _ctype(fn, args, ret):
+    try:
+        fn.argtypes = args
+        fn.restype = ret
+    except Exception:
+        pass
+
+
+_ctype(_u32.OpenClipboard, [wintypes.HWND], wintypes.BOOL)
+_ctype(_u32.CloseClipboard, [], wintypes.BOOL)
+_ctype(_u32.EmptyClipboard, [], wintypes.BOOL)
+_ctype(_u32.SetClipboardData, [wintypes.UINT, wintypes.HANDLE], wintypes.HANDLE)
+_ctype(_u32.GetClipboardData, [wintypes.UINT], wintypes.HANDLE)
+_ctype(_u32.IsClipboardFormatAvailable, [wintypes.UINT], wintypes.BOOL)
+_ctype(_k32.GlobalAlloc, [wintypes.UINT, ctypes.c_size_t], wintypes.HGLOBAL)
+_ctype(_k32.GlobalLock, [wintypes.HGLOBAL], ctypes.c_void_p)
+_ctype(_k32.GlobalUnlock, [wintypes.HGLOBAL], wintypes.BOOL)
+_ctype(_k32.GlobalFree, [wintypes.HGLOBAL], wintypes.HGLOBAL)
+_ctype(_k32.GlobalSize, [wintypes.HGLOBAL], ctypes.c_size_t)
+
 
 # ---------------------------------------------------------------- 基础工具
 def data_dir():
@@ -84,6 +112,7 @@ DATA_DIR = data_dir()
 DATA_FILE = os.path.join(DATA_DIR, "data.json")
 LEGACY_FILE = os.path.join(DATA_DIR, "items.txt")
 LOG_FILE = os.path.join(DATA_DIR, "error.log")
+_HOOKS_READY = False
 
 
 def log(msg):
@@ -92,6 +121,60 @@ def log(msg):
             f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + str(msg) + "\n")
     except Exception:
         pass
+
+
+def rotate_log(limit=512 * 1024):
+    """error.log 超过 limit 就滚动一份，避免长期运行后无限增长。"""
+    try:
+        if os.path.getsize(LOG_FILE) > limit:
+            os.replace(LOG_FILE, LOG_FILE + ".1")
+    except Exception:
+        pass
+
+
+def install_crash_hooks(root=None):
+    """把各种「静默退出」都变成 error.log 里的一行 traceback。
+
+    无控制台的窗口程序里，未捕获异常默认写到 stderr，等于直接丢弃；
+    一旦真闪退，用户侧只会看到窗口消失，什么都查不到。
+    """
+    def _dump(tag, et, ev, tb):
+        try:
+            log("%s:\n%s" % (tag, "".join(traceback.format_exception(et, ev, tb))))
+        except Exception:
+            pass
+
+    global _HOOKS_READY
+    if not _HOOKS_READY:
+        _HOOKS_READY = True
+        try:
+            sys.excepthook = lambda et, ev, tb: _dump("UNCAUGHT", et, ev, tb)
+        except Exception:
+            pass
+
+        def _thread_hook(args):
+            _dump("THREAD-UNCAUGHT[%s]" % getattr(args.thread, "name", "?"),
+                  args.exc_type, args.exc_value, args.exc_traceback)
+        try:
+            threading.excepthook = _thread_hook
+        except Exception:
+            pass
+
+        # 原生崩溃（访问越界等）也留一份 Python 栈，faulthandler 走独立 fd
+        try:
+            import faulthandler
+            _CRASH_FD = open(LOG_FILE, "a", encoding="utf-8", buffering=1)
+            faulthandler.enable(file=_CRASH_FD, all_threads=True)
+        except Exception:
+            pass
+
+    if root is not None:
+        def _tk_hook(et, ev, tb):
+            _dump("TK-CALLBACK", et, ev, tb)
+        try:
+            root.report_callback_exception = _tk_hook
+        except Exception:
+            pass
 
 
 def resource_path(rel):
@@ -151,38 +234,68 @@ def is_sensitive(t):
 
 
 def clip_set(text):
+    """写剪贴板。刻意不用 pywin32 的 SetClipboardData(CF_UNICODETEXT, str)：
+    那条路径在真机上会偶发 error(6, '句柄无效')，并且把调用进程一起带崩
+    （表现为点条目复制时窗口突然消失）。这里自己 GlobalAlloc 更可控。
+    """
+    try:
+        data = (text + "\0").encode("utf-16-le")
+    except Exception:
+        return False
     for _ in range(6):
-        try:
-            win32clipboard.OpenClipboard(None)
-            win32clipboard.EmptyClipboard()
-            win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, text)
-            win32clipboard.CloseClipboard()
-            return True
-        except Exception:
-            try:
-                win32clipboard.CloseClipboard()
-            except Exception:
-                pass
+        h = _k32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+        if not h:
             time.sleep(0.05)
+            continue
+        p = _k32.GlobalLock(h)
+        if not p:
+            _k32.GlobalFree(h)
+            time.sleep(0.05)
+            continue
+        try:
+            ctypes.memmove(p, data, len(data))
+        finally:
+            _k32.GlobalUnlock(h)
+        if not _u32.OpenClipboard(None):
+            _k32.GlobalFree(h)
+            time.sleep(0.05)
+            continue
+        try:
+            _u32.EmptyClipboard()
+            ok = _u32.SetClipboardData(CF_UNICODETEXT, h)
+        finally:
+            _u32.CloseClipboard()
+        if ok:
+            return True          # 交接成功后内存归系统所有，不能再 GlobalFree
+        _k32.GlobalFree(h)
+        time.sleep(0.05)
     return False
 
 
 def clip_get():
     for _ in range(3):
-        try:
-            win32clipboard.OpenClipboard(None)
-            if win32clipboard.IsClipboardFormatAvailable(win32con.CF_UNICODETEXT):
-                val = win32clipboard.GetClipboardData(win32con.CF_UNICODETEXT)
-            else:
-                val = None
-            win32clipboard.CloseClipboard()
-            return val
-        except Exception:
-            try:
-                win32clipboard.CloseClipboard()
-            except Exception:
-                pass
+        if not _u32.OpenClipboard(None):
             time.sleep(0.05)
+            continue
+        try:
+            if not _u32.IsClipboardFormatAvailable(CF_UNICODETEXT):
+                return None
+            h = _u32.GetClipboardData(CF_UNICODETEXT)
+            if not h:
+                return None
+            p = _k32.GlobalLock(h)
+            if not p:
+                return None
+            try:
+                # 按 GlobalSize 精确读，不能瞎给长度（wstring_at 会照读不误 -> 访问越界）
+                n = int(_k32.GlobalSize(h)) // 2
+                if n <= 0:
+                    return None
+                return ctypes.wstring_at(p, n).split("\0", 1)[0]
+            finally:
+                _k32.GlobalUnlock(h)
+        finally:
+            _u32.CloseClipboard()
     return None
 
 
@@ -889,15 +1002,43 @@ class App:
         self.save_geometry()
 
     def apply_region(self):
+        """给无边框窗口套圆角裁剪区。
+
+        两个必守的规矩：尺寸没变就不重复设（每次都会整窗重绘）；
+        SetWindowRgn 失败时系统没有接管 HRGN，必须自己 DeleteObject，
+        否则一次失败泄漏一个 GDI 句柄，攒够了整个进程行为都会失常。
+        """
         try:
             h = tk_hwnd(self.root)
             w = self.root.winfo_width()
             hh = self.root.winfo_height()
+            if not h or w <= 1 or hh <= 1:
+                return
+            if getattr(self, "_rg_key", None) == (h, w, hh):
+                return
             rgn = win32gui.CreateRoundRectRgn(0, 0, w + 1, hh + 1, 13, 13)
-            win32gui.SetWindowRgn(h, rgn, True)
+            if not rgn:
+                return
+            try:
+                ok = win32gui.SetWindowRgn(h, rgn, True)
+            except Exception as e:
+                ok = 0
+                log("SetWindowRgn: %r" % (e,))
+            if not ok:
+                try:
+                    win32gui.DeleteObject(rgn)
+                except Exception:
+                    pass
+                return
+            self._rg_key = (h, w, hh)
             try:
                 st = win32gui.GetClassLong(h, win32con.GCL_STYLE)
-                win32gui.SetClassLong(h, win32con.GCL_STYLE, st | CS_DROPSHADOW)
+                if not (st & CS_DROPSHADOW):
+                    style = st | CS_DROPSHADOW
+                    try:
+                        win32gui.SetClassLongPtr(h, win32con.GCL_STYLE, style)
+                    except Exception:
+                        win32gui.SetClassLong(h, win32con.GCL_STYLE, style)
             except Exception:
                 pass
         except Exception as e:
@@ -923,6 +1064,7 @@ class App:
     def _clear_region(self):
         try:
             _user32.SetWindowRgn(wintypes.HWND(tk_hwnd(self.root)), None, True)
+            self._rg_key = None      # 区域已被清掉，下次必须重设
         except Exception as e:
             log("clear_region: %r" % (e,))
 
@@ -1322,7 +1464,7 @@ class App:
         it = self.visible[idx]
         text = it["text"]
         if not clip_set(text):
-            self.toast("复制失败，剪贴板被占用")
+            self.toast("复制失败，剪贴板被其他程序占用，请稍后重试")
             return
         self.own_text = text
         self.own_ts = time.time()
@@ -1512,6 +1654,9 @@ class App:
                     t = clip_get()
                     if isinstance(t, str) and t.strip():
                         t = t.strip()
+                        # 只记长度和数字个数，不落内容：万一闪退能看出是哪次复制触发的
+                        log("clip len=%d digits=%d tab=%s" % (
+                            len(t), sum(ch.isdigit() for ch in t), self.tab))
                         own = (self.own_text == t and time.time() - self.own_ts < 2.0)
                         if not own and not is_sensitive(t):
                             self.add_history(t)
@@ -1620,7 +1765,8 @@ class App:
             "鼠标\n"
             "  拖标题栏移动 · 右下角拖动缩放\n"
             "  拖左侧序号调整顺序 · 星标收藏\n"
-            "  托盘右键：置顶 / 自动记录 / 主题 / 开机自启 / 导入导出")
+            "  托盘右键：置顶 / 自动记录 / 主题 / 开机自启 / 导入导出\n\n"
+            "版本 " + BUILD_TAG + "    日志：%LOCALAPPDATA%\\CopyPad\\error.log")
         try:
             if self.root.state() == "withdrawn":
                 self.show()
@@ -1630,29 +1776,19 @@ class App:
 
 
 # ---------------------------------------------------------------- 入口
-def excepthook(t, v, tb):
-    log("UNCAUGHT:\n" + "".join(traceback.format_exception(t, v, tb)))
-
-
-def thread_hook(args):
-    log("THREAD UNCAUGHT:\n" + "".join(
-        traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)))
-
-
 def main():
     enable_dpi()
-    sys.excepthook = excepthook
-    try:
-        threading.excepthook = thread_hook
-    except Exception:
-        pass
+    rotate_log()
+    install_crash_hooks()
     mutex = win32event.CreateMutex(None, 1, MUTEX_NAME)
     if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
         h = win32gui.FindWindow(WND_CLASS, "CopyPad")
         if h:
             win32gui.PostMessage(h, WM_SHOW_APP, 0, 0)
         return
+    log("---- start build %s ----" % BUILD_TAG)
     app = App()
+    install_crash_hooks(app.root)
     bridge = NativeBridge(app)
     app.bridge = bridge
     bridge.start()
