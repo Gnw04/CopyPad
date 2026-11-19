@@ -52,12 +52,12 @@ VERSION = '''VSVersionInfo(
       StringTable('040904B0', [
         StringStruct('CompanyName', 'CopyPad'),
         StringStruct('FileDescription', 'CopyPad Floating Clipboard Pad'),
-        StringStruct('FileVersion', '2.0.1.0'),
+        StringStruct('FileVersion', '2.0.2.0'),
         StringStruct('InternalName', 'CopyPad'),
         StringStruct('LegalCopyright', 'CopyPad'),
         StringStruct('OriginalFilename', 'CopyPad.exe'),
         StringStruct('ProductName', 'CopyPad'),
-        StringStruct('ProductVersion', '2.0.1.0')
+        StringStruct('ProductVersion', '2.0.2.0')
       ])
     ]),
     VarFileInfo([VarStruct('Translation', [1033, 1200])])
