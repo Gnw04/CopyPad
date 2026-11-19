@@ -113,6 +113,13 @@ python -m PyInstaller --noconfirm --clean --onefile --noconsole ^
 
 ## 更新日志
 
+**v2.0.2**（重要修复）
+
+- 修复「复制纯数字内容（电话、卡号、验证码）时剪贴板被清空、程序偶尔直接崩溃」的问题。根因是 `pywin32` 的 `win32clipboard.SetClipboardData(CF_UNICODETEXT, text)` 会把**纯数字字符串当成句柄**处理，返回 `error(6, '句柄无效')`，重试数次后还可能触发 `0xC0000374` 堆损坏。现改为自己用 `GlobalAlloc / GlobalLock / SetClipboardData` 写入，读写两条路径都不再经过 pywin32 的剪贴板封装。
+- 剪贴板读取改为按 `GlobalSize` 精确长度取值，避免越界读。
+- 增加崩溃取证：未捕获异常、线程异常、Tk 回调异常与原生崩溃都会写入 `%LOCALAPPDATA%\CopyPad\error.log`（超过 512 KB 自动滚动）。
+- 圆角裁剪区加了尺寸缓存与失败回收，避免 GDI 句柄泄漏。
+
 **v2.0.1**
 
 - 修复拖动缩放时窗口闪烁：拖动期间不再逐帧重设圆角裁剪（`SetWindowRgn` 会触发整窗重绘），改为松手时恢复；连续 mousemove 合并为每 16ms 一次重排，一次拖动的重绘次数从约 60 次降到 12 次
